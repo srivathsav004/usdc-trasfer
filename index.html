@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>CCTP Auto Transfer — Ethereum Sepolia → Fuji</title>
+
+  <style>
+    body {
+      margin: 0;
+      background: #000;
+      color: #0f0;
+      font-family: monospace;
+      padding: 20px;
+    }
+
+    button, input {
+      background: #111;
+      border: 1px solid #0f0;
+      color: #0f0;
+      padding: 8px 12px;
+      margin: 5px 0;
+      font-family: monospace;
+      cursor: pointer;
+    }
+
+    button:hover {
+      background: #0f0;
+      color: #000;
+    }
+
+    input {
+      width: 200px;
+    }
+
+    #log {
+      background: #000;
+      border: 1px solid #0f0;
+      height: 450px;
+      overflow-y: auto;
+      padding: 10px;
+      white-space: pre-wrap;
+      margin-top: 10px;
+      font-size: 13px;
+    }
+
+    .status {
+      margin: 10px 0;
+      padding: 10px;
+      border: 1px solid #0f0;
+    }
+  </style>
+</head>
+<body>
+
+  <h2>CCTP Auto Transfer (Ethereum Sepolia → Avalanche Fuji)</h2>
+
+  <div class="status">
+    <button onclick="window.connectWallet()">Connect Wallet</button>
+    <span id="addr"></span>
+  </div>
+
+  <div class="status">
+    Amount (USDC): <input id="amount" value="5" type="number" step="0.1"/>
+    <button onclick="window.startFullTransfer()">🚀 Run Auto Transfer</button>
+  </div>
+
+  <div id="log"></div>
+
+  <script type="module">
+    import { ethers } from "https://cdnjs.cloudflare.com/ajax/libs/ethers/6.8.1/ethers.min.js";
+
+    // -------- Ethereum Sepolia → Avalanche Fuji Addresses --------
+    const USDC_SEPOLIA = "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238";
+    const TOKEN_MESSENGER_SEPOLIA = "0x9f3B8679c73C2Fef8b59B4f3444d4e156fb70AA5";
+    const MESSAGE_TRANSMITTER_FUJI = "0xa9fb1b3009dcb79e2fe346c16a604b8fa8ae0a79";
+
+    const FUJI_DOMAIN = 1;
+    const SEPOLIA_CHAIN_ID = "0xaa36a7"; // 11155111
+    const FUJI_CHAIN_ID = "0xa869"; // 43113
+
+    const PROXY = "http://localhost:3000";
+
+    const logBox = document.getElementById("log");
+    let provider, signer, user;
+    let lastMessage, lastMessageHash;
+
+    function log(txt) {
+      const t = new Date().toISOString().split("T")[1].replace("Z", "");
+      logBox.textContent += `[${t}] ${txt}\n`;
+      logBox.scrollTop = logBox.scrollHeight;
+      console.debug(txt);
+    }
+
+    // -------- Wallet Connect --------
+    window.connectWallet = async function () {
+      try {
+        provider = new ethers.BrowserProvider(window.ethereum);
+        signer = await provider.getSigner();
+        user = await signer.getAddress();
+        document.getElementById("addr").textContent = " → " + user;
+        log("✅ Connected wallet: " + user);
+        
+        // Check if we're on Sepolia
+        const network = await provider.getNetwork();
+        if (network.chainId !== 11155111n) {
+          log("⚠️  Please switch to Ethereum Sepolia network");
+          await switchChain(SEPOLIA_CHAIN_ID);
+        }
+      } catch (e) {
+        log("❌ Error connecting wallet: " + e.message);
+      }
+    };
+
+    async function switchChain(chainId) {
+      try {
+        await window.ethereum.request({
+          method: "wallet_switchEthereumChain",
+          params: [{ chainId }]
+        });
+        log("✅ Switched to chain: " + chainId);
+      } catch (e) {
+        log("❌ Error switching chain: " + e.message);
+        throw e;
+      }
+    }
+
+    // -------- Main Auto Transfer --------
+    window.startFullTransfer = async function () {
+      try {
+        if (!user) {
+          log("❌ Please connect wallet first!");
+          return;
+        }
+
+        const amountStr = document.getElementById("amount").value;
+        if (!amountStr || parseFloat(amountStr) <= 0) {
+          log("❌ Please enter a valid amount");
+          return;
+        }
+
+        const amount = ethers.parseUnits(amountStr, 6); // USDC has 6 decimals
+        log(`💰 Amount to transfer: ${amountStr} USDC`);
+
+        // -------- STEP 1 — BURN USDC ON ETHEREUM SEPOLIA --------
+        log("=== STEP 1: Burning USDC on Ethereum Sepolia ===");
+        await switchChain(SEPOLIA_CHAIN_ID);
+
+        // Update provider and signer after chain switch
+        provider = new ethers.BrowserProvider(window.ethereum);
+        signer = await provider.getSigner();
+
+        const usdc = new ethers.Contract(
+          USDC_SEPOLIA, 
+          ["function approve(address spender, uint256 amount) returns (bool)"],
+          signer
+        );
+        
+        const messengerABI = [
+          "event MessageSent(bytes message)",
+          "function depositForBurn(uint256 amount, uint32 destinationDomain, bytes32 mintRecipient, address burnToken) external returns (uint64 nonce)"
+        ];
+        const messenger = new ethers.Contract(TOKEN_MESSENGER_SEPOLIA, messengerABI, signer);
+
+        log("📝 Approving TokenMessenger...");
+        let tx = await usdc.approve(TOKEN_MESSENGER_SEPOLIA, amount);
+        log("⏳ Approve TX: " + tx.hash);
+        await tx.wait();
+        log("✅ Approve confirmed");
+
+        log("🔥 Burning USDC on Sepolia...");
+        const recipientBytes32 = ethers.zeroPadValue(user, 32);
+
+        tx = await messenger.depositForBurn(amount, FUJI_DOMAIN, recipientBytes32, USDC_SEPOLIA);
+        log("⏳ Burn TX: " + tx.hash);
+
+        const rcpt = await tx.wait();
+        log("✅ Burn confirmed");
+
+        // FIXED: Properly parse the MessageSent event
+        const iface = new ethers.Interface(messengerABI);
+        let messageEvent = null;
+        
+        for (const l of rcpt.logs) {
+          try {
+            const parsed = iface.parseLog({ topics: l.topics, data: l.data });
+            if (parsed && parsed.name === "MessageSent") {
+              messageEvent = parsed;
+              break;
+            }
+          } catch (e) {
+            // Not our event, continue
+          }
+        }
+
+        if (!messageEvent) {
+          throw new Error("MessageSent event not found in transaction");
+        }
+
+        lastMessage = messageEvent.args.message;
+        log("📨 Message extracted: " + lastMessage.substring(0, 66) + "...");
+
+        lastMessageHash = ethers.keccak256(lastMessage);
+        log("🔑 Message Hash: " + lastMessageHash);
+
+        // -------- STEP 2 — GET ATTESTATION --------
+        log("=== STEP 2: Fetching Circle Attestation ===");
+        log("⏳ Waiting for attestation (30-90 seconds)...");
+
+        const res = await fetch(`${PROXY}/attestations/${lastMessageHash}`);
+        const data = await res.json();
+        
+        if (data.error) {
+          throw new Error("Attestation error: " + data.error);
+        }
+
+        const attestation = data.attestation;
+        if (!attestation || attestation === "PENDING") {
+          throw new Error("Attestation still pending or failed");
+        }
+        
+        log("✅ Attestation received: " + attestation.substring(0, 66) + "...");
+
+        // -------- STEP 3 — MINT ON FUJI --------
+        log("=== STEP 3: Minting USDC on Avalanche Fuji ===");
+        await switchChain(FUJI_CHAIN_ID);
+
+        // Update provider and signer after chain switch
+        provider = new ethers.BrowserProvider(window.ethereum);
+        signer = await provider.getSigner();
+
+        const transmitter = new ethers.Contract(
+          MESSAGE_TRANSMITTER_FUJI,
+          ["function receiveMessage(bytes calldata message, bytes calldata attestation) external returns (bool success)"],
+          signer
+        );
+
+        log("💚 Calling receiveMessage on Fuji...");
+        tx = await transmitter.receiveMessage(lastMessage, attestation);
+        log("⏳ Mint TX: " + tx.hash);
+        await tx.wait();
+
+        log("🎉 === TRANSFER COMPLETE === 🎉");
+        log(`✅ ${amountStr} USDC successfully transferred!`);
+        log("💰 Check your wallet on Avalanche Fuji!");
+
+      } catch (e) {
+        log("❌ ERROR: " + e.message);
+        console.error(e);
+      }
+    };
+
+    // Auto-connect on page load if MetaMask is available
+    if (window.ethereum) {
+      window.ethereum.on('accountsChanged', (accounts) => {
+        if (accounts.length > 0) {
+          window.location.reload();
+        }
+      });
+    }
+  </script>
+
+</body>
+</html>
